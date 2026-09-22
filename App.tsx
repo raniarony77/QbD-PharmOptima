@@ -152,26 +152,32 @@ const App: React.FC = () => {
         <StepIndicator currentStep={step} />
 
         {step === 1 && (
-          <div className="bg-white p-8 rounded-xl shadow-sm border border-gray-200 animate-fade-in">
-            <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
-              <Activity className="text-science-500" />
-              1. Define Objectives
-            </h2>
-            <div className="grid md:grid-cols-2 gap-6">
-              <button 
-                onClick={() => { setRequest({...request, goal: ExperimentGoal.SCREENING}); setStep(2); }}
-                className="group p-6 border-2 border-gray-100 rounded-xl hover:border-science-500 hover:bg-science-50 transition-all text-left"
-              >
-                <span className="block text-lg font-bold text-gray-800 mb-2 group-hover:text-science-700">Screening</span>
-                <p className="text-sm text-gray-600">Identify influential factors from a large pool.</p>
-              </button>
-              <button 
-                onClick={() => { setRequest({...request, goal: ExperimentGoal.OPTIMIZATION}); setStep(2); }}
-                className="group p-6 border-2 border-gray-100 rounded-xl hover:border-science-500 hover:bg-science-50 transition-all text-left"
-              >
-                <span className="block text-lg font-bold text-gray-800 mb-2 group-hover:text-science-700">Optimization</span>
-                <p className="text-sm text-gray-600">Find best settings using Response Surface.</p>
-              </button>
+          <div className="bg-white p-8 rounded-xl shadow-sm border border-gray-200 animate-fade-in space-y-8">
+            <div>
+              <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
+                <Activity className="text-science-500" />
+                1. Define Objectives
+              </h2>
+              <div className="grid md:grid-cols-2 gap-6">
+                <button 
+                  onClick={() => { setRequest({...request, goal: ExperimentGoal.SCREENING}); setStep(2); }}
+                  className="group p-6 border-2 border-gray-100 rounded-xl hover:border-science-500 hover:bg-science-50 transition-all text-left"
+                >
+                  <span className="block text-lg font-bold text-gray-800 mb-2 group-hover:text-science-700">Screening</span>
+                  <p className="text-sm text-gray-600">Identify influential factors from a large pool.</p>
+                </button>
+                <button 
+                  onClick={() => { setRequest({...request, goal: ExperimentGoal.OPTIMIZATION}); setStep(2); }}
+                  className="group p-6 border-2 border-gray-100 rounded-xl hover:border-science-500 hover:bg-science-50 transition-all text-left"
+                >
+                  <span className="block text-lg font-bold text-gray-800 mb-2 group-hover:text-science-700">Optimization</span>
+                  <p className="text-sm text-gray-600">Find best settings using Response Surface.</p>
+                </button>
+              </div>
+            </div>
+
+            <div id="citation-box" className="p-5 bg-science-50 rounded-xl border border-science-200 text-base md:text-lg text-slate-800 leading-relaxed font-bold shadow-sm text-center">
+              Please cite: Hathout RM, Ibrahim SS, El-Housseiny GS. QbD-PharmOptima: A New Research and Educational Generative Platform for AI-Assisted Design and Optimization of Drug Delivery Systems and Pharmaceutical Operations. BioChem. 2026; 6(3):22. <a href="https://doi.org/10.3390/biochem6030022" target="_blank" rel="noopener noreferrer" className="text-science-700 underline hover:text-science-900 font-bold">https://doi.org/10.3390/biochem6030022</a>, in any work or study in which this application will be utilized
             </div>
           </div>
         )}

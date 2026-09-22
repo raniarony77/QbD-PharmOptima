@@ -2,48 +2,190 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { AnalysisRequest, ExperimentalRun, AnalysisResult, ResponseAnalysis } from "../types";
 
 const getClient = () => {
-    const apiKey = process.env.API_KEY || '';
+    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
     if (!apiKey) {
         throw new Error("API Key is missing. Please check your configuration.");
     }
-    return new GoogleGenAI({ apiKey });
+    return new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+            headers: {
+                'User-Agent': 'aistudio-build',
+            }
+        }
+    });
 };
 
-export const generateDesignMatrix = async (request: AnalysisRequest, designName: string): Promise<ExperimentalRun[]> => {
-    try {
-        const ai = getClient();
-        const factorDesc = request.factors.map(f => `${f.name} (${f.levels} levels: ${f.low} to ${f.high})`).join(', ');
-        const isMixture = designName.toLowerCase().includes('mixture') || designName.toLowerCase().includes('simplex');
-        
-        const prompt = `
-        Generate a professional Design of Experiments (DoE) matrix for a "${designName}".
-        Factors: ${factorDesc}.
-        STRICT CONFIGURATION:
-        - Design Replicates: ${request.replicates}
-        - Center Points: ${request.centerPoints}
-        ${isMixture ? "CRITICAL: Component sum must be exactly 100 for every run." : ""}
-        Return STRICTLY JSON: array of {id, factors: {name: value}}.
-        `;
+export interface MixtureRow {
+  [key: string]: number;
+}
 
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: prompt,
-            config: { thinkingConfig: { thinkingBudget: 0 } }
-        });
+// 1. Helper function to validate and normalize mixture design sums programmatically
+export function validateAndNormalizeMixtureDesign(
+  matrix: MixtureRow[],
+  lowerBounds?: Record<string, number>,
+  upperBounds?: Record<string, number>,
+  targetSum: number = 1.0 // Accepts 1.0 or 100
+): MixtureRow[] {
+  if (!Array.isArray(matrix) || matrix.length === 0) return matrix;
 
-        const text = response.text || "[]";
-        const jsonStr = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        let runs = JSON.parse(jsonStr);
-        
-        return runs.map((r: any) => ({
-            id: r.id,
-            factors: r.factors,
-            results: {} 
-        }));
-    } catch (e) {
-        console.error("Design Matrix Error", e);
-        return [];
+  return matrix.map((row) => {
+    const normalizedRow: MixtureRow = { ...row };
+    const keys = Object.keys(row).filter((k) => typeof row[k] === 'number');
+
+    // Step A: Clamp non-negative values and apply boundary constraints FIRST
+    keys.forEach((k) => {
+      let val = Math.max(0, normalizedRow[k]); // Clamp negative values to zero
+      if (lowerBounds && lowerBounds[k] !== undefined) {
+        val = Math.max(val, lowerBounds[k]);
+      }
+      if (upperBounds && upperBounds[k] !== undefined) {
+        val = Math.min(val, upperBounds[k]);
+      }
+      normalizedRow[k] = val;
+    });
+
+    // Step B: Compute current row sum
+    let currentSum = keys.reduce((acc, k) => acc + normalizedRow[k], 0);
+
+    // Step C: Handle zero sum edge-case (equal distribution across factors)
+    if (currentSum === 0) {
+      const equalShare = targetSum / keys.length;
+      keys.forEach((k) => (normalizedRow[k] = equalShare));
+      currentSum = targetSum;
     }
+
+    // Step D: Normalize components proportionally to achieve exact target sum
+    keys.forEach((k) => {
+      normalizedRow[k] = Number(((normalizedRow[k] / currentSum) * targetSum).toFixed(4));
+    });
+
+    return normalizedRow;
+  });
+}
+
+// 2. Minimum degrees of freedom / run requirements helper
+export function validateMinimumRuns(
+  designType: string,
+  numFactors: number,
+  validRunsCount: number
+): { isValid: boolean; minRequired: number } {
+  let minRequired = 3; // Default fallback
+  const normalizedType = designType?.toLowerCase().trim() || '';
+
+  if (normalizedType.includes('box-behnken')) {
+    minRequired = 12;
+  } else if (
+    normalizedType.includes('central composite') ||
+    normalizedType.includes('rsm d-optimal') ||
+    normalizedType.includes('d-optimal')
+  ) {
+    minRequired = 1 + 2 * numFactors + (numFactors * (numFactors - 1)) / 2 + 1;
+  } else if (
+    normalizedType.includes('mixture') ||
+    normalizedType.includes('simplex')
+  ) {
+    minRequired = numFactors + (numFactors * (numFactors - 1)) / 2;
+  } else {
+    minRequired = Math.max(3, numFactors + 1);
+  }
+
+  return {
+    isValid: validRunsCount >= minRequired,
+    minRequired
+  };
+}
+
+// 3. Primary design matrix generator function
+export const generateDesignMatrix = async (
+  request: AnalysisRequest,
+  designName: string
+): Promise<ExperimentalRun[]> => {
+  try {
+    const ai = getClient();
+    const factorDesc = request.factors
+      .map((f) => `${f.name} (${f.levels} levels: ${f.low} to ${f.high})`)
+      .join(', ');
+    const isMixture =
+      designName.toLowerCase().includes('mixture') ||
+      designName.toLowerCase().includes('simplex');
+
+    const prompt = `
+Generate a professional Design of Experiments (DoE) matrix for a "${designName}".
+Factors: ${factorDesc}.
+STRICT CONFIGURATION:
+- Design Replicates: ${request.replicates}
+- Center Points: ${request.centerPoints}
+${isMixture ? 'CRITICAL: Component sum must be exactly 100 for every run.' : ''}
+Return STRICTLY JSON: array of {id, factors: {name: value}}.
+`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.6-flash',
+      contents: prompt,
+      config: {
+        temperature: 0.2,
+        seed: 42
+      }
+    });
+
+    const text = response.text || '[]';
+    const jsonStr = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    let runs = JSON.parse(jsonStr);
+
+    // Validate minimum run count requirements
+    if (Array.isArray(runs)) {
+      const validation = validateMinimumRuns(
+        designName,
+        request.factors.length,
+        runs.length
+      );
+      if (!validation.isValid) {
+        console.warn(
+          `Generated runs (${runs.length}) are less than minimum required (${validation.minRequired}) for ${designName}.`
+        );
+      }
+    }
+
+    // Apply Mixture Normalization & Boundary Clamping
+    if (isMixture && Array.isArray(runs)) {
+      const matrixRows = runs.map((r: any) => r.factors);
+      const lowerBounds: Record<string, number> = {};
+      const upperBounds: Record<string, number> = {};
+
+      request.factors.forEach((f) => {
+        lowerBounds[f.name] = parseFloat(f.low) || 0;
+        upperBounds[f.name] = parseFloat(f.high) || 0;
+      });
+
+      const sumHigh = request.factors.reduce(
+        (acc, f) => acc + (parseFloat(f.high) || 0),
+        0
+      );
+      const targetSum = sumHigh > 2 ? 100 : 1.0;
+
+      const normalizedRows = validateAndNormalizeMixtureDesign(
+        matrixRows,
+        lowerBounds,
+        upperBounds,
+        targetSum
+      );
+
+      runs = runs.map((r: any, idx: number) => ({
+        ...r,
+        factors: normalizedRows[idx] || r.factors
+      }));
+    }
+
+    return runs.map((r: any) => ({
+      id: r.id,
+      factors: r.factors,
+      results: {}
+    }));
+  } catch (e) {
+    console.error('Design Matrix Error', e);
+    return [];
+  }
 };
 
 const analyzeSingleResponse = async (
@@ -64,11 +206,31 @@ const analyzeSingleResponse = async (
     2. RESPONSE TRANSFORMATION: If the data shows non-constant variance or poor fit, you MAY apply a power transformation to the response (e.g., Sqrt(Y), Log(Y), 1/Y). If you do, the returned "equation" and "predicted" values MUST reflect this transformation.
     3. MATHEMATICAL INTEGRITY: The coefficients MUST be derived from the provided Experimental Data. No hallucinations.
     4. EXACT FIT & CORRELATION: The resulting equation MUST accurately correlate the factor values with their corresponding responses. Verification is mandatory: plugging factor values into your equation MUST yield the "predicted" values you return.
-    5. QUALITY TARGETS:
-       - R-Squared and Adjusted R-Squared MUST be ABOVE 0.90.
-       - Predicted R-Squared MUST be ABOVE 0.80.
-       - Adequate Precision MUST be ABOVE 4.0.
-       - The model p-value MUST be < 0.05.
+    5. ANALYSIS WORKFLOW:
+       You are an expert Quality by Design (QbD) statistical engine. Perform a rigorous Ordinary Least Squares (OLS) regression and ANOVA analysis on the provided dataset.
+
+       STEP 1: RAW MODEL FIT (UNCONSTRAINED)
+       1. Fit the full initial model (Linear, 2FI, or Quadratic) directly to the user's raw dataset.
+       2. Calculate and record the TRUE initial statistics without imposing targets:
+          - Initial R², Adjusted R², Predicted R²
+          - Initial Model p-value and Adequate Precision
+          - ANOVA table and regression coefficients
+
+       STEP 2: DIAGNOSTIC EVALUATION & CONDITIONAL REMEDIATION
+       Evaluate the initial fit against standard QbD adequacy thresholds (p < 0.05, R² > 0.80, Adequate Precision > 4.0):
+
+       - IF THE INITIAL FIT MEETS THRESHOLDS:
+         Accept the initial model as final.
+
+       - IF THE INITIAL FIT FALLS BELOW THRESHOLDS:
+         Execute model remediation protocols in sequence and evaluate if metrics improve:
+         a) Model Reduction: Perform backward elimination to remove non-significant terms (p > 0.0.5) while preserving model hierarchy. Re-evaluate ANOVA.
+         b) Power Transformation: Test standard Box-Cox transformations on response Y (e.g., Log10, Square Root, Inverse). Re-evaluate ANOVA.
+
+       STEP 3: FINAL REPORTING
+       1. State clearly whether the initial raw model was adequate or required remediation.
+       2. If remediation was performed, explicitly detail what changed (e.g., "Term X1*X2 removed due to p = 0.42; Log10 transformation applied").
+       3. Output the final, verified ANOVA table, regression equation, and goodness-of-fit metrics.
     6. DETERMINISM: For the exact same data, always return the exact same coefficients.
     7. CODED COEFFICIENTS: Return coefficients based on coded factor levels (-1, 0, +1).
     8. DIAGNOSTICS: 
@@ -78,10 +240,11 @@ const analyzeSingleResponse = async (
     `;
 
     const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-preview', // Use pro for higher mathematical precision
+        model: 'gemini-3.6-flash',
         contents: prompt,
         config: {
-            seed: 42, // Enforce deterministic output
+            seed: 42,
+            temperature: 0.2,
             responseMimeType: "application/json",
             responseSchema: {
                 type: Type.OBJECT,
@@ -200,8 +363,11 @@ export const analyzeExperimentalResults = async (request: AnalysisRequest, desig
         Object.values(r.results).every(v => v !== "" && !isNaN(parseFloat(v)))
     );
 
-    if (validRuns.length < 3) {
-        throw new Error("Insufficient data points. Please provide at least 3 completed experimental runs.");
+    const validation = validateDoEDegreesOfFreedom(designName, request.factors.length, validRuns.length);
+    if (!validation.isValid) {
+        throw new Error(
+            validation.errorMessage || `Insufficient experimental data: ${designName} requires a minimum of ${validation.minRequiredRuns} valid runs to satisfy model degrees of freedom, but only ${validRuns.length} were provided.`
+        );
     }
 
     const factorData = validRuns.map(r => r.factors);
@@ -216,3 +382,113 @@ export const analyzeExperimentalResults = async (request: AnalysisRequest, desig
     
     return { resultsByResponse };
 };
+
+
+
+
+
+
+
+// --- PASTE THIS AT THE VERY BOTTOM OF THE FILE ---
+
+export interface ValidationResult {
+  isValid: boolean;
+  minRequiredRuns: number;
+  residualDoF: number;
+  designType: string;
+  errorMessage?: string;
+}
+
+export function validateDoEDegreesOfFreedom(
+  rawDesignType: string,
+  factorCount: number,
+  actualRunCount: number,
+  replicateCount: number = 0
+): ValidationResult {
+  const design = rawDesignType.toLowerCase().trim();
+  const k = factorCount;
+  
+  let p = k + 1; 
+
+  if (design.includes('box-behnken') || design.includes('central composite') || design.includes('quadratic')) {
+    p = 1 + 2 * k + (k * (k - 1)) / 2;
+  } else if (design.includes('mixture') || design.includes('simplex')) {
+    p = k + (k * (k - 1)) / 2;
+  } else if (design.includes('factorial') || design.includes('2fi')) {
+    p = 1 + k + (k * (k - 1)) / 2;
+  }
+
+  const minRequiredRuns = p + 3;
+  const residualDoF = actualRunCount - p;
+
+  if (actualRunCount < minRequiredRuns) {
+    return {
+      isValid: false,
+      minRequiredRuns,
+      residualDoF,
+      designType: rawDesignType,
+      errorMessage: `Insufficient experimental runs (${actualRunCount}). For a ${rawDesignType} with ${k} factors, at least ${p} runs are required to estimate model terms, plus at least 3 residual degrees of freedom for ANOVA error estimation (Minimum required = ${minRequiredRuns} runs).`
+    };
+  }
+
+  return {
+    isValid: true,
+    minRequiredRuns,
+    residualDoF,
+    designType: rawDesignType
+  };
+}
+
+// ==========================================
+// ZETA POTENTIAL TRANSFORM UTILITIES
+// ==========================================
+
+export interface ZetaTransformResult {
+  transformedValues: number[];
+  wasZeroPresent: boolean;
+  epsilonUsed: number;
+}
+
+/**
+ * 1. Forward Transformation: Log(|ZP| + epsilon)
+ * Handles negative zeta potential values and prevents log(0) undefined errors.
+ */
+export function transformZetaPotential(
+  rawZPValues: number[],
+  epsilon: number = 0.0001
+): ZetaTransformResult {
+  let wasZeroPresent = false;
+
+  const transformedValues = rawZPValues.map((zp) => {
+    // Take absolute magnitude (ignores negative surface charge polarity)
+    const magnitude = Math.abs(zp);
+
+    // Track if near-zero values at isoelectric point are present
+    if (magnitude < epsilon) {
+      wasZeroPresent = true;
+    }
+
+    // Apply natural log with continuity offset
+    return Math.log(magnitude + epsilon);
+  });
+
+  return {
+    transformedValues,
+    wasZeroPresent,
+    epsilonUsed: epsilon
+  };
+}
+
+/**
+ * 2. Inverse Transformation: exp(y_pred) - epsilon
+ * Restores predicted model outputs back to real-space absolute magnitude |ZP| (in mV).
+ */
+export function inverseTransformZetaPotential(
+  predictedLogValue: number,
+  epsilon: number = 0.0001
+): number {
+  const magnitude = Math.exp(predictedLogValue) - epsilon;
+  
+  // Ensure non-negative output for absolute magnitude
+  return Math.max(0, Number(magnitude.toFixed(4)));
+}

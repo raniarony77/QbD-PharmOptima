@@ -26,6 +26,7 @@ interface OptResult {
 const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors, responses, isMixture = false, runs = [] }) => {
     const [predictionInputs, setPredictionInputs] = useState<Record<string, string>>({});
     const [predictedValue, setPredictedValue] = useState<number | null>(null);
+    const [showDesignPoints, setShowDesignPoints] = useState<boolean>(true);
     const [plotX, setPlotX] = useState<string>('');
     const [plotY, setPlotY] = useState<string>('');
     const [plotResponse, setPlotResponse] = useState<string>('');
@@ -35,6 +36,7 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
     const [optMax, setOptMax] = useState<number>(100);
     const [topSuggestions, setTopSuggestions] = useState<OptResult[]>([]);
     const [isExporting, setIsExporting] = useState(false);
+    const [equationString, setEquationString] = useState<string>('');
 
     const containerRefs = {
         plot3d: useRef<HTMLDivElement>(null),
@@ -133,7 +135,7 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
                 content += `</tbody></table>`;
             }
             
-            content += `<div class='footer'>Confidential Scientific Report. Analysis conducted via PharmOptima Deterministic Regression Engine. Validated for 95% Confidence Threshold.</div>`;
+            content += `<div class='footer'>Confidential Scientific Report. Analysis structured via QbD-PharmOptima AI Engine.</div>`;
 
             const blob = new Blob(['\ufeff' + header + content + '</body></html>'], { type: 'application/msword' });
             const url = URL.createObjectURL(blob);
@@ -161,12 +163,59 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
 
     const activeResult = results.resultsByResponse[plotResponse];
 
+    const applyInverseTransform = useCallback((y: number, transformation?: ResponseAnalysis['transformation']) => {
+        if (!transformation || transformation.type === 'none') return y;
+        const { type } = transformation;
+        try {
+            if (type === 'sqrt') return Math.pow(y, 2);
+            if (type === 'log') return Math.exp(Math.min(y, 80));
+            if (type === 'inverse') return Math.abs(y) < 1e-12 ? 0 : 1 / y;
+            if (type === 'inverse_sqrt') return Math.abs(y) < 1e-12 ? 0 : 1 / Math.pow(y, 2);
+        } catch (e) {
+            return y;
+        }
+        return y;
+    }, []);
+
+    const getEquationString = useCallback(() => {
+        if (!activeResult?.modelCoefficients) return "No model coefficients available";
+        const { intercept, linear, quadratic, interactions } = activeResult.modelCoefficients;
+        let eq = `${intercept.toFixed(4)}`;
+        
+        if (linear) {
+            Object.entries(linear).forEach(([name, coeff]) => {
+                eq += ` ${coeff >= 0 ? '+' : '-'} ${Math.abs(coeff).toFixed(4)}·[${name}]`;
+            });
+        }
+        if (quadratic) {
+            Object.entries(quadratic).forEach(([name, coeff]) => {
+                eq += ` ${coeff >= 0 ? '+' : '-'} ${Math.abs(coeff).toFixed(4)}·[${name}]²`;
+            });
+        }
+        if (interactions) {
+            interactions.forEach(t => {
+                eq += ` ${t.coefficient >= 0 ? '+' : '-'} ${Math.abs(t.coefficient).toFixed(4)}·[${t.factor1}]·[${t.factor2}]`;
+            });
+        }
+        
+        const trans = activeResult.transformation?.type;
+        let prefix = "Y";
+        if (trans === 'log') prefix = "Log(Y)";
+        else if (trans === 'sqrt') prefix = "Sqrt(Y)";
+        else if (trans === 'inverse') prefix = "1/Y";
+        else if (trans === 'inverse_sqrt') prefix = "1/Sqrt(Y)";
+        
+        return `${prefix} = ${eq} (using coded units -1 to +1)`;
+    }, [activeResult]);
+
     const getModelRange = useCallback((resName: string) => {
         const res = results.resultsByResponse[resName];
         if (!res?.diagnostics?.predicted?.length) return { min: 0, max: 100 };
-        const data = res.diagnostics.predicted.filter(v => !isNaN(v));
+        const data = res.diagnostics.predicted
+            .filter(v => !isNaN(v))
+            .map(v => applyInverseTransform(v, res.transformation));
         return { min: Math.min(...data), max: Math.max(...data) };
-    }, [results]);
+    }, [results, applyInverseTransform]);
 
     useEffect(() => {
         const range = getModelRange(plotResponse);
@@ -178,7 +227,8 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
         
         const resDef = responses.find(r => r.name === plotResponse);
         if (resDef) setOptGoal(resDef.goal);
-    }, [plotResponse, getModelRange, responses, optGoal]);
+        setEquationString(getEquationString());
+    }, [plotResponse, getModelRange, responses, optGoal, getEquationString]);
 
     const toCoded = useCallback((val: number, factorName: string) => {
         const factor = factors.find(f => f.name === factorName);
@@ -223,26 +273,19 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
         }
 
         // Handle Inverse Transformation with safety checks
-        let finalY = y;
-        if (activeResult.transformation && activeResult.transformation.type !== 'none') {
-            const { type } = activeResult.transformation;
-            try {
-                if (type === 'sqrt') finalY = Math.pow(y, 2);
-                else if (type === 'log') finalY = Math.exp(Math.min(y, 50)); // Cap exp to prevent Infinity
-                else if (type === 'inverse') finalY = Math.abs(y) < 1e-9 ? 0 : 1 / y;
-                else if (type === 'inverse_sqrt') finalY = Math.abs(y) < 1e-9 ? 0 : 1 / Math.pow(y, 2);
-            } catch (e) {
-                finalY = y;
-            }
-        }
+        const finalY = applyInverseTransform(y, activeResult.transformation);
 
         // Final safety check for NaN/Infinity
         if (isNaN(finalY) || !isFinite(finalY)) return NaN;
         
         return finalY;
-    }, [activeResult, factors, toCoded]);
+    }, [activeResult, factors, toCoded, applyInverseTransform]);
 
-    const calculatePrediction = () => setPredictedValue(calculatePredictionInternal(predictionInputs));
+    const calculatePrediction = useCallback(() => setPredictedValue(calculatePredictionInternal(predictionInputs)), [calculatePredictionInternal, predictionInputs]);
+
+    useEffect(() => {
+        calculatePrediction();
+    }, [predictionInputs, calculatePrediction]);
 
     const calculateDesirability = useCallback((val: number) => {
         if (isNaN(val)) return NaN;
@@ -290,6 +333,11 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
         const fX = factors.find(f => f.name === plotX), fY = factors.find(f => f.name === plotY);
         if (!fX || !fY) return;
         const xMin = parseFloat(fX.low), xMax = parseFloat(fX.high), yMin = parseFloat(fY.low), yMax = parseFloat(fY.high);
+        
+        const responseValues = runs.map(r => parseFloat(r.results?.[plotResponse] || 'NaN')).filter(v => !isNaN(v));
+        const obsMin = responseValues.length > 0 ? Math.min(...responseValues) : 0;
+        const obsMax = responseValues.length > 0 ? Math.max(...responseValues) : 100;
+        
         const steps = 100, xVals = [], yVals = [], zMat = [], dMat = [];
         
         for (let i = 0; i <= steps; i++) xVals.push(xMin + (i * (xMax - xMin) / steps));
@@ -330,6 +378,16 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
             zMat.push(rZ); dMat.push(rD);
         }
 
+        // Calculate plot dynamic range based strictly on grid values to highlight the model relationship
+        const finalValidZ = zMat.flat().filter(v => !isNaN(v));
+        const gridMin = finalValidZ.length > 0 ? Math.min(...finalValidZ) : 0;
+        const gridMax = finalValidZ.length > 0 ? Math.max(...finalValidZ) : 100;
+        
+        // Focus plot strictly on model prediction range (with small 5% buffer for clarity)
+        const zBuffer = (gridMax - gridMin) * 0.05 || 0.1;
+        const plotZMin = gridMin - zBuffer;
+        const plotZMax = gridMax + zBuffer;
+
         const topMarker = topSuggestions.length > 0 ? {
             x: topSuggestions.map(s => s.factors[plotX]),
             y: topSuggestions.map(s => s.factors[plotY]),
@@ -346,36 +404,71 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
             autosize: true
         };
 
+        const experimentalPoints3D = runs.length > 0 ? {
+            x: runs.map(r => r.factors[plotX]),
+            y: runs.map(r => r.factors[plotY]),
+            z: runs.map(r => parseFloat(r.results?.[plotResponse] || 'NaN')),
+            mode: 'markers',
+            type: 'scatter3d',
+            name: 'Observed Data',
+            marker: {
+                color: '#1e293b',
+                size: 5,
+                symbol: 'circle',
+                line: { color: '#ffffff', width: 2 }
+            }
+        } : null;
+
         if (containerRefs.plot3d.current) {
-            window.Plotly.react(containerRefs.plot3d.current, [{ 
+            const surfaceData: any = { 
                 z: zMat, x: xVals, y: yVals, 
                 type: 'surface', 
-                colorscale: 'Turbo', 
+                colorscale: [[0, '#ff0000'], [0.5, '#ffffff'], [1, '#0000ff']], 
+                cmin: plotZMin, cmax: plotZMax,
                 contours: { 
                     z: { 
                         show: true, 
-                        project: { z: true }, 
                         usecolormap: true, 
+                        project: { z: true }, 
                         highlightcolor: "#fff",
-                        width: 2
+                        width: 2,
+                        start: plotZMin,
+                        end: plotZMax,
+                        size: (plotZMax - plotZMin) / 20
                     } 
                 },
                 lighting: {
-                    ambient: 0.6,
+                    ambient: 0.7,
                     diffuse: 0.8,
                     fresnel: 0.2,
                     specular: 0.1,
                     roughness: 0.5
                 },
-                colorbar: { thickness: 20, len: 0.8, title: { text: plotResponse, font: { size: 12, weight: 'bold' } } }
-            }], { 
+                colorbar: { 
+                    thickness: 20, 
+                    len: 0.8, 
+                    title: { text: plotResponse, font: { size: 12, weight: 'bold' } },
+                    tickformat: '.2f'
+                }
+            };
+            
+            const dataToRender = [surfaceData];
+            if (showDesignPoints && experimentalPoints3D) dataToRender.push(experimentalPoints3D);
+
+            window.Plotly.react(containerRefs.plot3d.current, dataToRender, { 
                 ...commonLayout, 
                 title: { text: `3D Response Surface: ${plotResponse}`, font: { size: 18, weight: 'bold' } },
                 scene: { 
                     xaxis: { title: plotX, backgroundcolor: "rgb(250, 250, 250)", showbackground: true, titlefont: { size: 14, weight: 'bold' } }, 
                     yaxis: { title: plotY, backgroundcolor: "rgb(245, 245, 245)", showbackground: true, titlefont: { size: 14, weight: 'bold' } }, 
-                    zaxis: { title: 'Predicted Y', backgroundcolor: "rgb(240, 240, 240)", showbackground: true, titlefont: { size: 14, weight: 'bold' } },
-                    camera: { eye: { x: 1.8, y: 1.8, z: 1.2 } },
+                    zaxis: { 
+                        title: 'Predicted Y', 
+                        backgroundcolor: "rgb(240, 240, 240)", 
+                        showbackground: true, 
+                        titlefont: { size: 14, weight: 'bold' },
+                        range: [plotZMin, plotZMax]
+                    },
+                    camera: { eye: { x: 1.5, y: 1.5, z: 1.5 } },
                     aspectmode: 'cube'
                 } 
             });
@@ -400,25 +493,35 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
             const data: any[] = [{ 
                 z: zMat, x: xVals, y: yVals, 
                 type: 'contour', 
-                colorscale: 'Electric', 
+                colorscale: [[0, '#ff0000'], [0.5, '#ffffff'], [1, '#0000ff']], 
+                zmin: plotZMin, zmax: plotZMax,
                 contours: { 
                     showlabels: true, 
-                    labelfont: { size: 12, color: '#fff', weight: 'bold' },
+                    labelfont: { size: 12, color: '#1e293b', weight: 'bold' },
                     coloring: 'heatmap',
                     showlines: true,
-                    ncontours: 25,
+                    start: plotZMin,
+                    end: plotZMax,
+                    size: (plotZMax - plotZMin) / 20,
                     labelformat: '.2f'
                 },
-                line: { width: 1, color: 'rgba(255,255,255,0.3)' },
-                colorbar: { thickness: 20, len: 0.9, title: { text: plotResponse, font: { size: 12, weight: 'bold' } } }
+                line: { width: 1, color: 'rgba(15, 23, 42, 0.1)' },
+                colorbar: { 
+                    thickness: 20, 
+                    len: 0.9, 
+                    title: { text: plotResponse, font: { size: 12, weight: 'bold' } },
+                    tickformat: '.2f'
+                }
             }];
-            if (experimentalPoints) data.push(experimentalPoints);
+            if (showDesignPoints && experimentalPoints) data.push(experimentalPoints);
             window.Plotly.react(containerRefs.plotContour.current, data, { 
                 ...commonLayout, 
+                width: 560,
+                height: 560,
+                autosize: false,
                 title: { text: `Contour Isopleth Map`, font: { size: 18, weight: 'bold' } }, 
                 xaxis: { title: plotX, gridcolor: '#f1f5f9', constrain: 'domain', zeroline: false, titlefont: { size: 14, weight: 'bold' } }, 
-                yaxis: { title: plotY, gridcolor: '#f1f5f9', scaleanchor: 'x', zeroline: false, titlefont: { size: 14, weight: 'bold' } },
-                autosize: true
+                yaxis: { title: plotY, gridcolor: '#f1f5f9', zeroline: false, titlefont: { size: 14, weight: 'bold' } }
             });
         }
 
@@ -426,7 +529,7 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
             const data: any[] = [{ 
                 z: dMat, x: xVals, y: yVals, 
                 type: 'contour', 
-                colorscale: [[0, '#ef4444'], [0.25, '#f97316'], [0.5, '#facc15'], [0.75, '#a3e635'], [1, '#22c55e']], 
+                colorscale: [[0, '#ff0000'], [0.5, '#ffffff'], [1, '#0000ff']], 
                 zmin: 0, zmax: 1, 
                 contours: { 
                     showlabels: true, 
@@ -438,20 +541,27 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
                     showlines: true,
                     labelformat: '.2f'
                 },
-                line: { width: 1, color: 'rgba(0,0,0,0.1)' },
-                colorbar: { thickness: 20, len: 0.9, title: { text: 'Desirability', font: { size: 12, weight: 'bold' } } }
+                line: { width: 1, color: 'rgba(67, 56, 202, 0.15)' },
+                colorbar: { 
+                    thickness: 20, 
+                    len: 0.9, 
+                    title: { text: 'Desirability', font: { size: 12, weight: 'bold' } },
+                    tickformat: '.2f'
+                }
             }];
             if (topMarker) data.push(topMarker);
-            if (experimentalPoints) data.push(experimentalPoints);
+            if (showDesignPoints && experimentalPoints) data.push(experimentalPoints);
             window.Plotly.react(containerRefs.plotDesirability.current, data, { 
                 ...commonLayout, 
+                width: 560,
+                height: 560,
+                autosize: false,
                 title: { text: `Desirability (0-1) Landscape`, font: { size: 18, weight: 'bold', color: '#4338ca' } }, 
                 xaxis: { title: plotX, gridcolor: '#f1f5f9', constrain: 'domain', zeroline: false, titlefont: { size: 14, weight: 'bold' } }, 
-                yaxis: { title: plotY, gridcolor: '#f1f5f9', scaleanchor: 'x', zeroline: false, titlefont: { size: 14, weight: 'bold' } },
-                autosize: true
+                yaxis: { title: plotY, gridcolor: '#f1f5f9', zeroline: false, titlefont: { size: 14, weight: 'bold' } }
             });
         }
-    }, [plotX, plotY, plotResponse, activeResult, predictionInputs, topSuggestions, calculatePredictionInternal, calculateDesirability, factors]);
+    }, [plotX, plotY, plotResponse, activeResult, predictionInputs, topSuggestions, calculatePredictionInternal, calculateDesirability, factors, showDesignPoints]);
 
     useEffect(() => {
         if (!window.Plotly || !activeResult?.diagnostics) return;
@@ -596,20 +706,40 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
                     <label className="block text-[10px] font-black text-slate-500 uppercase mb-2 px-1 tracking-widest group-hover:text-science-400 transition-colors">Target Quality Response Domain</label>
                     <select className="w-full p-3 rounded-2xl border-2 border-slate-800 bg-science-950/50 text-xs font-black text-science-100 focus:border-science-400 outline-none transition-all shadow-lg" value={plotResponse} onChange={e => setPlotResponse(e.target.value)}>{responses.map(r => <option key={r.name} value={r.name}>{r.name}</option>)}</select>
                 </div>
+                <div className="flex items-center gap-3 bg-slate-800/50 p-4 rounded-2xl border border-slate-700/50">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest cursor-pointer select-none" htmlFor="toggleDesignPoints">Show Design Points</label>
+                    <input 
+                        id="toggleDesignPoints"
+                        type="checkbox" 
+                        className="w-5 h-5 rounded border-2 border-slate-700 bg-slate-900 text-science-500 focus:ring-science-500 transition-all cursor-pointer" 
+                        checked={showDesignPoints} 
+                        onChange={e => setShowDesignPoints(e.target.checked)}
+                    />
+                </div>
             </div>
 
             {/* Model Response Surfaces */}
+            <div className="bg-white/70 backdrop-blur-md p-6 rounded-[2.5rem] border border-slate-200 shadow-xl mb-10 overflow-hidden relative">
+                <div className="absolute top-0 left-0 w-1.5 h-full bg-science-500"></div>
+                <div className="flex items-center gap-3 mb-3">
+                    <Sigma size={18} className="text-science-600"/>
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Mathematical Model Equation (Coded Units)</span>
+                </div>
+                <div className="font-mono text-lg font-bold text-slate-800 break-words whitespace-pre-wrap">{equationString}</div>
+                <p className="text-[10px] text-slate-400 mt-2 italic font-medium">Factor values map to [-1, +1] range. This equation is exactly what determines the surfaces and predictions below.</p>
+            </div>
+
             <div className="grid lg:grid-cols-2 gap-10">
                 <div className="lg:col-span-2 bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-2xl relative h-[600px] transition-all hover:shadow-science-100/20 group">
                     <div ref={containerRefs.plot3d} className="w-full h-full"></div>
                     <div className="absolute top-6 right-6 opacity-0 group-hover:opacity-100 transition-opacity bg-white/80 backdrop-blur p-2 rounded-xl text-[10px] font-bold text-slate-500">Interactive 3D Surface</div>
                 </div>
-                <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-2xl relative h-[550px] transition-all hover:shadow-science-100/20 group">
-                    <div ref={containerRefs.plotContour} className="w-full h-full"></div>
+                <div className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-2xl relative h-[650px] transition-all hover:shadow-science-100/20 group flex flex-col items-center">
+                    <div ref={containerRefs.plotContour} className="w-full h-full flex items-center justify-center"></div>
                     <div className="absolute top-6 right-6 opacity-0 group-hover:opacity-100 transition-opacity bg-white/80 backdrop-blur p-2 rounded-xl text-[10px] font-bold text-slate-500">Isopleth Model Plot</div>
                 </div>
-                <div className="bg-indigo-50/20 p-8 rounded-[2.5rem] border-2 border-indigo-100 shadow-2xl relative h-[550px] ring-4 ring-indigo-500/5 group">
-                    <div ref={containerRefs.plotDesirability} className="w-full h-full"></div>
+                <div className="bg-indigo-50/20 p-8 rounded-[2.5rem] border-2 border-indigo-100 shadow-2xl relative h-[650px] ring-4 ring-indigo-500/5 group flex flex-col items-center">
+                    <div ref={containerRefs.plotDesirability} className="w-full h-full flex items-center justify-center"></div>
                     <div className="absolute top-6 right-6 opacity-100 bg-white/90 backdrop-blur p-2 px-3 rounded-xl text-[10px] font-black text-indigo-600 border border-indigo-100">Desirability Prob. Landscape</div>
                 </div>
             </div>
@@ -621,7 +751,7 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
                     <div>
                         <div className="inline-flex items-center gap-2 bg-yellow-400/10 text-yellow-400 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-4 border border-yellow-400/20 shadow-xl">Quality Optimizer Suite</div>
                         <h2 className="text-5xl font-black flex items-center gap-5 tracking-tighter leading-none"><Trophy className="text-yellow-400 drop-shadow-[0_0_15px_rgba(250,204,21,0.6)]" size={48} /> Optimization Solver</h2>
-                        <p className="text-slate-400 text-lg mt-4 max-w-2xl font-medium leading-relaxed">Finding the exact Pareto-optimal factor combinations by evaluating 25,000 search points across the design space to maximize desirability.</p>
+                        <p className="text-slate-400 text-lg mt-4 max-w-2xl font-medium leading-relaxed">Estimates near-optimal trade-offs via a 25,000-point Monte Carlo exploratory search across the design space to maximize desirability.</p>
                     </div>
                     <button onClick={findOptimalConditions} className="group bg-white text-slate-950 px-14 py-6 rounded-3xl hover:bg-science-100 font-black flex items-center justify-center gap-5 shadow-[0_25px_60px_rgba(0,0,0,0.5)] transition-all active:scale-95 transform hover:-translate-y-1">
                         <Search size={24} className="group-hover:scale-125 transition-transform" /> Execute Solver
@@ -673,7 +803,15 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
                         {factors.map(f => (
                             <div key={f.name} className="space-y-3">
                                 <label className="block text-[10px] font-black text-slate-400 uppercase px-1 tracking-widest">{f.name} <span className="text-slate-300 normal-case ml-2">[{f.low}-{f.high}]</span></label>
-                                <input type="number" step="any" className="w-full p-5 bg-slate-50 border-2 border-slate-100 rounded-[1.25rem] focus:border-science-500 focus:bg-white focus:shadow-xl outline-none text-lg font-bold text-slate-800 transition-all shadow-sm" value={predictionInputs[f.name] || ''} onChange={e => setPredictionInputs({...predictionInputs, [f.name]: e.target.value})}/>
+                                <input 
+                                    type="number" 
+                                    step="any" 
+                                    className="w-full p-5 bg-slate-50 border-2 border-slate-100 rounded-[1.25rem] focus:border-science-500 focus:bg-white focus:shadow-xl outline-none text-lg font-bold text-slate-800 transition-all shadow-sm" 
+                                    value={predictionInputs[f.name] || ''} 
+                                    onChange={e => {
+                                        setPredictionInputs(prev => ({ ...prev, [f.name]: e.target.value }));
+                                    }}
+                                />
                             </div>
                         ))}
                     </div>
@@ -695,7 +833,7 @@ const AnalysisDashboard: React.FC<AnalysisDashboardProps> = ({ results, factors,
                         <Sigma size={24} className="text-science-500 shrink-0 mt-1.5" />
                         <div className="space-y-2">
                             <p className="text-sm text-slate-800 leading-relaxed font-black">Analytical Validity Notice:</p>
-                            <p className="text-[11px] text-slate-500 leading-relaxed font-medium">This predictor utilizes deterministic 95% confidence interval coefficients calculated from the input data set. To prevent scientific extrapolation and ensure QbD compliance, result estimations are strictly clamped to the experimental boundaries: <span className="text-science-600 font-bold">[{getModelRange(plotResponse).min.toFixed(3)} - {getModelRange(plotResponse).max.toFixed(3)}]</span>.</p>
+                            <p className="text-[11px] text-slate-500 leading-relaxed font-medium">This predictor utilizes deterministic 95% confidence interval coefficients calculated from the input data set. It provides a direct mathematical estimation based on the model equation for any factor combination. For maximum accuracy, inputs should remain within the experimental boundaries: <span className="text-science-600 font-bold">[{getModelRange(plotResponse).min.toFixed(3)} - {getModelRange(plotResponse).max.toFixed(3)}]</span>.</p>
                         </div>
                     </div>
                 </div>
